@@ -16,6 +16,8 @@
 // =============================================================================
 // Private Helper Functions (Internal Linkage)
 // =============================================================================
+namespace http {
+
 namespace {
 
 // get sockaddr, IPv4 or IPv6
@@ -28,10 +30,11 @@ void *get_in_addr(sockaddr *sa) {
 
 // Converts a sockaddr into a human-readable IP string
 std::string to_string(const addrinfo *p) {
-  if (!p)
+  if (!p || !p->ai_addr)
     return "Unknown Address";
 
   char parsed_str[INET6_ADDRSTRLEN];
+
   if (inet_ntop(
           p->ai_family,
           get_in_addr(p->ai_addr),
@@ -39,6 +42,7 @@ std::string to_string(const addrinfo *p) {
           sizeof(parsed_str))) {
     return std::string(parsed_str);
   }
+
   return "Invalid Address";
 }
 
@@ -90,6 +94,7 @@ http::HTTPResponse parse_message_header(std::string_view msg) {
 }
 
 } // namespace
+} // namespace http
 
 // =============================================================================
 // Public HTTP Namespace Implementation
