@@ -1,11 +1,13 @@
 #pragma once
 
+#include <cstddef>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
 #include <unordered_map>
+#include <vector>
 
 // =============================================================================
 // Public HTTP Namespace API
@@ -16,7 +18,8 @@ namespace http {
 // Constants & Types
 // -----------------------------------------------------------------------------
 constexpr std::string_view DEFAULT_PORT = "8080";
-constexpr int MAX_DATA_SIZE = 1024; // in bytes
+constexpr int MAX_BUFFER_SIZE = 1024; // in bytes
+constexpr std::string_view HEADER_DELIMITER = "\r\n\r\n";
 
 using header_map = std::unordered_map<std::string, std::string>;
 
@@ -42,8 +45,12 @@ public:
   int status_code;
   std::string status;
   http::header_map headers;
+  std::vector<char> body;
 
-  HTTPResponse(const std::string &status, const http::header_map &headers);
+  HTTPResponse(
+      const std::string &status,
+      const http::header_map &headers,
+      std::vector<char> body);
 };
 
 // -----------------------------------------------------------------------------
@@ -89,6 +96,6 @@ std::string create_request_message_header(
 // Returns established socket file descriptor. Returns -1 on error.
 int connect_tcp(std::string addr_string, std::string addr_port);
 
-void get(std::string addr_string, std::string addr_port);
+HTTPResponse get(std::string addr_string, std::string addr_port);
 
 } // namespace http

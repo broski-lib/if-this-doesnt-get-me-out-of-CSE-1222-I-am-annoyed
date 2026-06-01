@@ -35,5 +35,11 @@ int main(int argc, char *argv[]) {
   }
 
   // TODO: create a response class
-  http::get(addr_string, addr_port);
+  http::HTTPResponse res = http::get(addr_string, addr_port);
+  std::cout << "Status: \n| " << res.status << "\n";
+  std::cout << "Headers: \n";
+  for (const auto &[key, val] : res.headers) {
+    std::cout << "| " << key << ": " << val << "\n";
+  }
+  std::cout << "Body:\n\n" << res.body.data() << "\n";
 }

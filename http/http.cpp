@@ -1,4 +1,5 @@
 #include "http.h"
+#include <algorithm>
 #include <arpa/inet.h>
 #include <cassert>
 #include <cstddef>
@@ -12,12 +13,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <unordered_map>
+#include <vector>
 
 // =============================================================================
 // Private Helper Functions (Internal Linkage)
 // =============================================================================
 namespace http {
-
 namespace {
 
 // get sockaddr, IPv4 or IPv6
@@ -61,7 +62,8 @@ std::string build_message_header(
 }
 
 // Parse standardized HTTP 1.1 header
-http::HTTPResponse parse_message_header(std::string_view msg) {
+http::HTTPResponse
+parse_response(std::string_view header, std::vector<char> &body_buffer) {
   std::string status_line;
   http::header_map headers{};
 
@@ -69,8 +71,8 @@ http::HTTPResponse parse_message_header(std::string_view msg) {
   size_t prev_pos{0};
   bool is_first_line = true;
 
-  while ((pos = msg.find("\r\n", prev_pos)) != std::string_view::npos) {
-    std::string_view line = msg.substr(prev_pos, pos - prev_pos);
+  while ((pos = header.find("\r\n", prev_pos)) != std::string_view::npos) {
+    std::string_view line = header.substr(prev_pos, pos - prev_pos);
 
     if (line.empty())
       break;
@@ -80,17 +82,39 @@ http::HTTPResponse parse_message_header(std::string_view msg) {
       // TEMPORARY: This code only handles 1.1
       assert(line.substr(0, 8) == "HTTP/1.1");
       status_line = std::string(line);
+
+      prev_pos = pos + 2;
+      continue;
     }
 
     size_t end_key_index = line.find(":");
+    if (end_key_index == std::string_view::npos) {
+      std::cout << "Malformed header line: `" << line << "`\n";
+      continue;
+    }
+
     std::string_view key = line.substr(0, end_key_index);
-    std::string_view value = line.substr(end_key_index + 1, line.length());
+    std::string_view value = line.substr(end_key_index + 1);
+
+    // Trim leading spaces/tabs
+    size_t value_start = value.find_first_not_of(" \t");
+    if (value_start != std::string_view::npos) {
+      value = value.substr(value_start);
+    } else {
+      value = ""; // empty
+    }
+
+    // Trim trailing spaces/tabs/carriage
+    size_t value_end = value.find_last_not_of(" \t\r\n");
+    if (value_end != std::string_view::npos) {
+      value = value.substr(0, value_end + 1);
+    }
 
     headers[std::string(key)] = std::string(value);
     prev_pos = pos + 2;
   }
 
-  return http::HTTPResponse(status_line, headers);
+  return http::HTTPResponse(status_line, headers, std::move(body_buffer));
 }
 
 } // namespace
@@ -105,8 +129,10 @@ namespace http {
 // HTTPResponse Class Methods
 // -----------------------------------------------------------------------------
 HTTPResponse::HTTPResponse(
-    const std::string &status, const http::header_map &headers)
-    : status(status), headers(headers) {
+    const std::string &status,
+    const http::header_map &headers,
+    std::vector<char> body)
+    : status(status), headers(headers), body(std::move(body)) {
   size_t first_space_idx = status.find(" ");
 
   if (first_space_idx != std::string::npos) {
@@ -179,8 +205,7 @@ int connect_tcp(std::string addr_string, std::string addr_port) {
   }
 
   if (p == nullptr) {
-    freeaddrinfo(
-        resolvedinfo); // Make sure to clean up if loop fails completely
+    freeaddrinfo(resolvedinfo); // clean up if loop fails completely
     return -1;
   }
 
@@ -190,7 +215,8 @@ int connect_tcp(std::string addr_string, std::string addr_port) {
   return sockfd;
 }
 
-void get(std::string addr_string, std::string addr_port) {
+// Run a get request to the specified addr and addr_port
+HTTPResponse get(std::string addr_string, std::string addr_port) {
   // Establish connection
   int sockfd = http::connect_tcp(addr_string, addr_port);
   if (sockfd == -1) {
@@ -201,24 +227,65 @@ void get(std::string addr_string, std::string addr_port) {
 
   std::unordered_map<std::string, std::string> headers{{"Connection", "close"}};
   std::string message_header = http::create_request_message_header(
-      HTTP_METHOD::GET, addr_string + ":" + addr_port, "/headers", headers);
+      HTTP_METHOD::GET, addr_string, "/headers", headers);
 
   int bytes_sent =
       send(sockfd, message_header.c_str(), message_header.length(), 0);
   std::cout << "Sent " << bytes_sent << " bytes\n";
 
-  // buffer read header
+  // buffer response header
+  std::vector<char> response_header_buffer{};
+  std::vector<char> response_body_buffer{};
+  bool header_read = false;
   int numbytes;
-  char buf[MAX_DATA_SIZE];
-  if ((numbytes = recv(sockfd, buf, MAX_DATA_SIZE - 1, 0)) == -1) {
-    perror("recv");
-    exit(1);
+  char buf[MAX_BUFFER_SIZE];
+  while ((numbytes = recv(sockfd, buf, MAX_BUFFER_SIZE - 1, 0)) != 0) {
+    if (numbytes == -1) {
+      perror("recv");
+      exit(1);
+    }
+
+    if (!header_read) {
+      response_header_buffer.insert(
+          response_header_buffer.end(), buf, buf + numbytes);
+
+      // binary search for delimiter
+      auto delimiter_pos = std::search(
+          response_header_buffer.begin(),
+          response_header_buffer.end(),
+          HEADER_DELIMITER.begin(),
+          HEADER_DELIMITER.end());
+
+      if (delimiter_pos != response_header_buffer.end()) {
+        header_read = true;
+
+        // Everything after the delimiter belongs to the body
+        auto body_start_pos = delimiter_pos + HEADER_DELIMITER.length();
+
+        // Remaining bytes belong to body
+        response_body_buffer.insert(
+            response_body_buffer.end(),
+            body_start_pos,
+            response_header_buffer.end());
+
+        // Keep \r\n\r\n because of how parsing is handled.
+        response_header_buffer.erase(
+            body_start_pos, response_header_buffer.end());
+      }
+    } else {
+      response_body_buffer.insert(
+          response_body_buffer.end(), buf, buf + numbytes);
+    }
   }
 
-  buf[numbytes] = '\0';
-  std::cout << "Received " << buf << "\n";
+  // recast to a string
+  std::string header_string(
+      reinterpret_cast<const char *>(response_header_buffer.data()),
+      response_header_buffer.size());
 
   close(sockfd);
+
+  return parse_response(header_string, response_body_buffer);
 }
 
 } // namespace http
