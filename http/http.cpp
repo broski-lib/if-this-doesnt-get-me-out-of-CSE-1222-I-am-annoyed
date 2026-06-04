@@ -216,7 +216,8 @@ int connect_tcp(std::string addr_string, std::string addr_port) {
 }
 
 // Run a get request to the specified addr and addr_port
-HTTPResponse get(std::string addr_string, std::string addr_port) {
+HTTPResponse
+get(std::string addr_string, std::string addr_port, std::string path) {
   // Establish connection
   int sockfd = http::connect_tcp(addr_string, addr_port);
   if (sockfd == -1) {
@@ -227,7 +228,7 @@ HTTPResponse get(std::string addr_string, std::string addr_port) {
 
   std::unordered_map<std::string, std::string> headers{{"Connection", "close"}};
   std::string message_header = http::create_request_message_header(
-      HTTP_METHOD::GET, addr_string, "/headers", headers);
+      HTTP_METHOD::GET, addr_string, path, headers);
 
   int bytes_sent =
       send(sockfd, message_header.c_str(), message_header.length(), 0);
