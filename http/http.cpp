@@ -3,30 +3,53 @@
 #include <arpa/inet.h>
 #include <cassert>
 #include <cstddef>
+#include <cstdio>
 #include <cstring>
+#include <errno.h>
 #include <iostream>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <optional>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <string>
 #include <string_view>
 #include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <vector>
 
 // =============================================================================
-// Private Helper Functions (Internal Linkage)
+// Helper Functions
 // =============================================================================
 namespace http {
-namespace {
-
 // get sockaddr, IPv4 or IPv6
 void *get_in_addr(sockaddr *sa) {
   if (sa->sa_family == AF_INET)
     return &(((struct sockaddr_in *)sa)->sin_addr);
 
   return &(((struct sockaddr_in6 *)sa)->sin6_addr);
+}
+
+// =============================================================================
+// Private Helper Functions (Internal Linkage)
+// =============================================================================
+namespace {
+// handle cleaning up dead child processes
+void sigchld_handler(int s) {
+  (void)s; // quiet unused variable warning
+
+  // waitpid() might overwrite errno, so we save and restore it:
+  int saved_errno = errno;
+
+  while (waitpid(-1, NULL, WNOHANG) > 0)
+    ;
+
+  errno = saved_errno;
 }
 
 // Converts a sockaddr into a human-readable IP string
@@ -211,6 +234,77 @@ int connect_tcp(std::string addr_string, std::string addr_port) {
 
   std::cout << "Established connection to " << to_string(p) << "\n";
   freeaddrinfo(resolvedinfo);
+
+  return sockfd;
+}
+
+// Returns established socket file descriptor. Returns -1 on error.
+int listen_tcp(std::string addr_string, std::string addr_port) {
+  int sockfd;
+  int result;
+  addrinfo hints;
+  addrinfo *resolvedinfo, *p;
+
+  memset(&hints, 0, sizeof hints);
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  hints.ai_flags = AI_PASSIVE;
+
+  // empty address use loopback (caused by nullptr)
+  const char *addr = (addr_string.empty() ? nullptr : addr_string.c_str());
+
+  result = getaddrinfo(addr, addr_port.c_str(), &hints, &resolvedinfo);
+  if (result != 0) {
+    std::cout << "Failed to parse address: " << gai_strerror(result) << "\n";
+    return -1;
+  }
+
+  // loop through all the results and connect to the first we can
+  for (p = resolvedinfo; p != nullptr; p = p->ai_next) {
+    sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+    if (sockfd == -1) {
+      perror("socket");
+      continue;
+    }
+
+    int yes = 1;
+    if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1) {
+      perror("setsockopt");
+      return -1;
+    }
+
+    if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+      close(sockfd);
+      perror("bind");
+      continue;
+    }
+
+    break;
+  }
+
+  if (p == nullptr) {
+    freeaddrinfo(resolvedinfo); // clean up if loop fails completely
+    std::cout << "Failed to bind\n";
+    return -1;
+  }
+
+  std::cout << "Listening on " << to_string(p) << "\n";
+  freeaddrinfo(resolvedinfo);
+
+  if (listen(sockfd, LISTEN_BACKLOG) == -1) {
+    perror("listen");
+    return -1;
+  }
+
+  struct sigaction sa;
+  sa.sa_handler = sigchld_handler; // reap all dead processes
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+
+  if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+    perror("sigaction");
+    exit(1);
+  }
 
   return sockfd;
 }

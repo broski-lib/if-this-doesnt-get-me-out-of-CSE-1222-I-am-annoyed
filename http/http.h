@@ -18,6 +18,7 @@ namespace http {
 // Constants & Types
 // -----------------------------------------------------------------------------
 constexpr std::string_view DEFAULT_PORT = "8080";
+constexpr int LISTEN_BACKLOG = 10;    // max pending connections
 constexpr int MAX_BUFFER_SIZE = 1024; // in bytes
 constexpr std::string_view HEADER_DELIMITER = "\r\n\r\n";
 
@@ -79,6 +80,13 @@ constexpr std::string_view to_string(HTTP_METHOD method) {
 }
 
 // -----------------------------------------------------------------------------
+// Helper Functions
+// -----------------------------------------------------------------------------
+
+// get sockaddr, IPv4 or IPv6
+void *get_in_addr(sockaddr *sa);
+
+// -----------------------------------------------------------------------------
 // HTTP Parsing
 // -----------------------------------------------------------------------------
 
@@ -95,6 +103,9 @@ std::string create_request_message_header(
 
 // Returns established socket file descriptor. Returns -1 on error.
 int connect_tcp(std::string addr_string, std::string addr_port);
+
+// Returns established socket file descriptor. Returns -1 on error.
+int listen_tcp(std::string addr_string, std::string addr_port);
 
 HTTPResponse
 get(std::string addr_string, std::string addr_port, std::string path = "/");
