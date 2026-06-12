@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package broski_connect;
+
+// The administration service definition
+service AdminService {
+  rpc SendCommand(SendCommandRequest) returns (SendCommandResponse);
+}
+
+message SendCommandRequest {
+  string command = 1;
+}
+
+message SendCommandResponse {
+  int32 exit_code = 1;
+  string output = 2;
+}

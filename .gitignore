@@ -1,6 +1,8 @@
 # Generated Binaries
 http_client
 http_server
+bc_client
+bc_server
 
 # Prerequisites
 *.d
