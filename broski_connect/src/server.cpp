@@ -6,35 +6,69 @@
 #include <grpcpp/server_builder.h>
 #include <grpcpp/server_context.h>
 #include <grpcpp/support/status.h>
+#include <grpcpp/support/sync_stream.h>
 #include <string>
 
 using broski_connect::AdminService;
+using grpc::Status;
 
 class AdminServiceImpl final : public broski_connect::AdminService::Service {
-  grpc::Status SendCommand(
+  Status ListDevices(
       grpc::ServerContext *context,
-      const broski_connect::SendCommandRequest *request,
-      broski_connect::SendCommandResponse *reply) override {
+      const broski_connect::ListDevicesRequest *request,
+      broski_connect::ListDevicesResponse *response) override {
 
-    std::cout << "Received command: " << request->command() << std::endl;
+    // TODO!
 
-    // Mocking execution logic
-    reply->set_exit_code(0);
-    reply->set_output("Executed successfully: " + request->command());
+    return Status::OK;
+  };
 
-    return grpc::Status::OK;
-  }
+  Status GetDevice(
+      grpc::ServerContext *context,
+      const broski_connect::GetDeviceRequest *request,
+      broski_connect::Device *response) override {
+
+    // TODO!
+
+    return Status::OK;
+  };
+
+  Status DispatchCommand(
+      grpc::ServerContext *context,
+      const broski_connect::DispatchCommandRequest *request,
+      broski_connect::DispatchCommandResponse *response) override {
+
+    // TODO!
+
+    return Status::OK;
+  };
+
+  Status StreamJobOutput(
+      grpc::ServerContext *context,
+      const broski_connect::StreamJobRequest *request,
+      grpc::ServerWriter<broski_connect::CommandOutputChunk> *response)
+      override {
+
+    // TODO!
+
+    return Status::OK;
+  };
 };
+
+class AgentServiceImpl final : public broski_connect::AgentService::Service {};
 
 void run_server() {
   std::string addr{"[::]:5000"};
-  AdminServiceImpl service;
+  AdminServiceImpl admin_service;
+  AgentServiceImpl agent_service;
 
   grpc::EnableDefaultHealthCheckService(true);
   grpc::ServerBuilder builder;
 
   builder.AddListeningPort(addr, grpc::InsecureServerCredentials());
-  builder.RegisterService(&service);
+
+  builder.RegisterService(&admin_service);
+  builder.RegisterService(&agent_service);
 
   std::unique_ptr<grpc::Server> server(builder.BuildAndStart());
   std::cout << "Server listening on " << addr << std::endl;
