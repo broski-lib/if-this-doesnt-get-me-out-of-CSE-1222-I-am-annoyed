@@ -1,5 +1,6 @@
 #include "service.grpc.pb.h"
 #include "service.pb.h"
+#include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/security/server_credentials.h>
 #include <grpcpp/server.h>
 #include <grpcpp/server_builder.h>
@@ -29,6 +30,7 @@ void run_server() {
   std::string addr{"[::]:5000"};
   AdminServiceImpl service;
 
+  grpc::EnableDefaultHealthCheckService(true);
   grpc::ServerBuilder builder;
 
   builder.AddListeningPort(addr, grpc::InsecureServerCredentials());

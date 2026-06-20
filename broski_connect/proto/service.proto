@@ -1,17 +1,188 @@
 syntax = "proto3";
 
-package broski_connect;
+package connect_broski;
 
-// The administration service definition
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+
+// ==============================================================================
+// ENUMS
+// ==============================================================================
+
+enum TaskState {
+  TASK_STATE_UNSPECIFIED = 0;
+  TASK_STATE_QUEUED = 1;
+  TASK_STATE_RUNNING = 2;
+  TASK_STATE_SUCCESS = 3;
+  TASK_STATE_FAILED = 4;
+}
+
+enum DeviceStatus {
+  DEVICE_STATUS_UNSPECIFIED = 0;
+  DEVICE_STATUS_ONLINE = 1;
+  DEVICE_STATUS_OFFLINE = 2;
+  DEVICE_STATUS_ERROR = 3;
+}
+
+enum PowerAction {
+  POWER_ACTION_UNSPECIFIED = 0;
+  POWER_ACTION_REBOOT = 1;
+  POWER_ACTION_SHUTDOWN = 2;
+}
+
+enum ServiceAction {
+  SERVICE_ACTION_UNSPECIFIED = 0;
+  SERVICE_ACTION_START = 1;
+  SERVICE_ACTION_STOP = 2;
+  SERVICE_ACTION_RESTART = 3;
+}
+
+// ==============================================================================
+// MVP COMMAND PAYLOADS
+// ==============================================================================
+
+message GetSystemInfoCommand {
+  bool include_hardware = 1;
+  bool include_network = 2;
+}
+
+message PowerCommand {
+  PowerAction action = 1;
+  bool force = 2;
+  int32 delay_seconds = 3;
+}
+
+message ManageServiceCommand {
+  string service_name = 1;
+  ServiceAction action = 2;
+}
+
+message UpdateConfigurationCommand {
+  string config_payload = 1;
+  string config_version = 2;
+  bool restart_agent = 3;
+}
+
+message InstallUpdateCommand {
+  string update_url = 1;
+  string target_version = 2;
+  string sha256_hash = 3;
+}
+
+message ExecuteScriptCommand {
+  string script_content = 1;
+  int32 timeout_seconds = 2;
+  string interpreter = 3;
+}
+
+message CommandInstruction {
+  string job_id = 1;
+  google.protobuf.Timestamp issued_at = 2;
+
+  oneof payload {
+    GetSystemInfoCommand get_system_info = 3;
+    PowerCommand power = 4;
+    ManageServiceCommand manage_service = 5;
+    UpdateConfigurationCommand update_config = 6;
+    InstallUpdateCommand install_update = 7;
+    ExecuteScriptCommand execute_script = 8;
+  }
+}
+
+// ==============================================================================
+// DATA MODELS
+// ==============================================================================
+
+message Device {
+  string device_id = 1;
+  string hostname = 2;
+  string os_version = 3;
+  string agent_version = 4;
+  DeviceStatus status = 5;
+  google.protobuf.Timestamp last_seen = 6;
+}
+
+message DeviceIdentity {
+  string device_id = 1;
+  string auth_token = 2;
+}
+
+message CommandOutputChunk {
+  string job_id = 1;
+  string device_id = 2;
+  TaskState state = 3;
+  bytes stdout_chunk = 4;
+  bytes stderr_chunk = 5;
+  optional int32 exit_code = 6;
+  google.protobuf.Timestamp reported_at = 7;
+}
+
+// ==============================================================================
+// ADMIN SERVICE (Client -> Server)
+// ==============================================================================
+
 service AdminService {
-  rpc SendCommand(SendCommandRequest) returns (SendCommandResponse);
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice(GetDeviceRequest) returns (Device);
+  rpc DispatchCommand(DispatchCommandRequest) returns (DispatchCommandResponse);
+  rpc StreamJobOutput(StreamJobRequest) returns (stream CommandOutputChunk);
 }
 
-message SendCommandRequest {
-  string command = 1;
+message ListDevicesRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  string filter = 3;
 }
 
-message SendCommandResponse {
-  int32 exit_code = 1;
-  string output = 2;
+message ListDevicesResponse {
+  repeated Device devices = 1;
+  string next_page_token = 2;
+}
+
+message GetDeviceRequest {
+  string device_id = 1;
+}
+
+message DispatchCommandRequest {
+  string target_device_id = 1;
+  CommandInstruction instruction = 2;
+}
+
+message DispatchCommandResponse {
+  string job_id = 1;
+  TaskState initial_state = 2;
+}
+
+message StreamJobRequest {
+  string job_id = 1;
+}
+
+// ==============================================================================
+// AGENT SERVICE (Agent -> Server)
+// ==============================================================================
+
+service AgentService {
+  rpc RegisterDevice(RegisterRequest) returns (RegisterResponse);
+  rpc ReportTelemetry(TelemetryRequest) returns (google.protobuf.Empty);
+  rpc ListenForCommands(DeviceIdentity) returns (stream CommandInstruction);
+  rpc ReportCommandOutput(stream CommandOutputChunk) returns (google.protobuf.Empty);
+}
+
+message RegisterRequest {
+  string hostname = 1;
+  string os_version = 2;
+  string agent_version = 3;
+  string initial_auth_token = 4;
+}
+
+message RegisterResponse {
+  string assigned_device_id = 1;
+  string session_token = 2;
+}
+
+message TelemetryRequest {
+  string device_id = 1;
+  float cpu_usage_percent = 2;
+  float memory_usage_mb = 3;
+  google.protobuf.Timestamp timestamp = 4;
 }
