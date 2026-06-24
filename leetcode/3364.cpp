@@ -4,8 +4,7 @@ using std::vector;
 
 class Solution {
 public:
-  int sum_vector(
-      const vector<int> &nums, const size_t &start, const size_t &len) {
+  int sum_vector(const vector<int> &nums, size_t start, size_t len) {
     int sum{0};
     size_t counted{0};
     for (size_t idx = start; counted < len; idx++) {
