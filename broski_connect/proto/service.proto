@@ -1,13 +1,95 @@
+// =============================================================================
+// broski_connect - gRPC service definition
+// =============================================================================
+//
+// Architecture
+// ------------
+//
+//   [Admin Client]  --(AdminService)-->  [Server / Controller]  --(AgentService)-->  [Agent x N]
+//                                                  |
+//                                                  +--> [persistent state: devices, tokens, jobs, groups]
+//
+// The server is the single source of truth. Agents never talk to each other.
+// All cross-network reachability is solved by the server: the admin only
+// needs to reach the server; the server keeps long-lived streams to each
+// agent so the agent does not need to be publicly addressable.
+//
+// Enrollment (MVP-critical)
+// -------------------------
+//   1. Admin calls AdminService.EnrollDevice.
+//      Server mints a one-time EnrollmentToken (short TTL, optionally
+//      constrained via EnrollmentHints: expected hostname/serial/machine-id,
+//      auto-assigned group, tags).
+//   2. Admin delivers the token to the device out-of-band (paste, QR code,
+//      deep link, OOBE hook). This is the ONLY user interaction on the
+//      device. The agent does the rest on its own.
+//   3. Agent calls AgentService.Enroll with:
+//        - the token string
+//        - DeviceFingerprint (hostname, OS, machine-id, serial, etc.)
+//        - agent public key (for future mTLS / signed payloads)
+//        - agent version
+//      Server validates the token, atomically:
+//        - burns the token
+//        - creates a Device row
+//        - persists the public key
+//        - issues a session token (bearer credential for AgentService)
+//      Server returns device_id, session_token, session_expires_at, and
+//      a ServerConfig (heartbeat interval, reconnect interval, etc).
+//   4. From that point on, the agent authenticates with the session token
+//      and never touches the enrollment token again. The token is a
+//      single-use secret.
+//
+// MVP scope
+// ---------
+//   - Token-based enrollment, session-token bearer auth.
+//   - Device inventory + basic groups.
+//   - Command dispatch with streaming output (single device + group fanout).
+//   - Liveness via heartbeat and a richer telemetry report.
+//
+// Out of MVP scope (planned)
+// --------------------------
+//   See FUTURE SCOPE at the bottom of this file. Every capability listed
+//   there is a known need for a real device-management product; they are
+//   intentionally not in the wire contract yet to keep MVP shippable.
+//
+// Versioning
+// ----------
+//   The package is `broski_connect.v1`. Breaking changes bump the major.
+//   Additive changes (new RPCs, new fields with new numbers, new oneof
+//   variants) are allowed within v1. Reserve, never reuse, field numbers.
+// =============================================================================
+
 syntax = "proto3";
 
-package broski_connect;
+package broski_connect.v1;
 
+import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
 
-// ==============================================================================
+option go_package = "github.com/broski/broski_connect/gen/go/broski_connect/v1;broski_connect_v1";
+
+// =============================================================================
 // ENUMS
-// ==============================================================================
+// =============================================================================
+
+enum EnrollmentState {
+  ENROLLMENT_STATE_UNSPECIFIED = 0;
+  ENROLLMENT_STATE_PENDING = 1; // token issued, not yet consumed
+  ENROLLMENT_STATE_CONSUMED = 2; // a device enrolled against it
+  ENROLLMENT_STATE_REVOKED = 3; // admin revoked it
+  ENROLLMENT_STATE_EXPIRED = 4; // TTL elapsed unused
+}
+
+enum DeviceStatus {
+  DEVICE_STATUS_UNSPECIFIED = 0;
+  DEVICE_STATUS_ENROLLING = 1; // token issued, not yet Enroll()'d
+  DEVICE_STATUS_ONLINE = 2;
+  DEVICE_STATUS_OFFLINE = 3;
+  DEVICE_STATUS_ERROR = 4;
+  DEVICE_STATUS_DECOMMISSIONED = 5;
+  DEVICE_STATUS_QUARANTINED = 6; // FUTURE: see FUTURE SCOPE.G
+}
 
 enum TaskState {
   TASK_STATE_UNSPECIFIED = 0;
@@ -15,19 +97,17 @@ enum TaskState {
   TASK_STATE_RUNNING = 2;
   TASK_STATE_SUCCESS = 3;
   TASK_STATE_FAILED = 4;
-}
-
-enum DeviceStatus {
-  DEVICE_STATUS_UNSPECIFIED = 0;
-  DEVICE_STATUS_ONLINE = 1;
-  DEVICE_STATUS_OFFLINE = 2;
-  DEVICE_STATUS_ERROR = 3;
+  TASK_STATE_CANCELED = 5;
+  TASK_STATE_TIMED_OUT = 6;
 }
 
 enum PowerAction {
   POWER_ACTION_UNSPECIFIED = 0;
   POWER_ACTION_REBOOT = 1;
   POWER_ACTION_SHUTDOWN = 2;
+  POWER_ACTION_SLEEP = 3;
+  POWER_ACTION_WAKE = 4;
+  // FUTURE: POWER_ACTION_LOCK, POWER_ACTION_LOGOUT
 }
 
 enum ServiceAction {
@@ -35,21 +115,119 @@ enum ServiceAction {
   SERVICE_ACTION_START = 1;
   SERVICE_ACTION_STOP = 2;
   SERVICE_ACTION_RESTART = 3;
+  SERVICE_ACTION_ENABLE = 4;
+  SERVICE_ACTION_DISABLE = 5;
+  SERVICE_ACTION_RELOAD = 6;
 }
 
-// ==============================================================================
-// MVP COMMAND PAYLOADS
-// ==============================================================================
+// =============================================================================
+// ENROLLMENT (MVP)
+// =============================================================================
+
+// Server-side record of an enrollment token. The `token` secret is only
+// returned in the EnrollDeviceResponse and is never echoed back on read.
+message EnrollmentToken {
+  string id = 1; // server-side opaque id
+  string token = 2; // secret - set only on create
+  EnrollmentState state = 3;
+  google.protobuf.Timestamp issued_at = 4;
+  google.protobuf.Timestamp expires_at = 5;
+  google.protobuf.Timestamp consumed_at = 6;
+  string consumed_by_device_id = 7; // set after Enroll succeeds
+  string created_by_admin_id = 8;
+  string label = 9; // human label, e.g. "Laptop - sales"
+  EnrollmentHints hints = 10;
+}
+
+// Optional constraints bound to a token at issuance time. If set, the server
+// requires the matching agent to present the same values, which prevents
+// token reuse on a different machine.
+message EnrollmentHints {
+  string expected_hostname = 1;
+  string expected_serial = 2;
+  string expected_machine_id = 3;
+  string group_id = 4; // auto-assign to this group on enroll
+  map<string, string> tags = 5;
+}
+
+// =============================================================================
+// IDENTITY / DEVICE MODELS
+// =============================================================================
+
+message DeviceFingerprint {
+  string hostname = 1;
+  string os = 2; // "linux", "darwin", "windows", "android", "ios"
+  string os_version = 3;
+  string arch = 4; // "x86_64", "aarch64", ...
+  string machine_id = 5; // OS-stable id (machine-id, IOPlatformUUID, ...)
+  string hardware_serial = 6;
+  string hardware_uuid = 7;
+  string mac_address = 8; // primary interface
+  string manufacturer = 9;
+  string model = 10;
+}
+
+message ServerConfig {
+  // Knobs the server hands back at enrollment time so the server can tune
+  // agent behavior without a new proto.
+  int32 heartbeat_interval_seconds = 1;
+  int32 command_stream_reconnect_seconds = 2;
+  int32 telemetry_interval_seconds = 3;
+}
+
+message Device {
+  string device_id = 1;
+  string hostname = 2;
+  string os = 3;
+  string os_version = 4;
+  string arch = 5;
+  string agent_version = 6;
+  DeviceStatus status = 7;
+  google.protobuf.Timestamp enrolled_at = 8;
+  google.protobuf.Timestamp last_seen = 9;
+  string hardware_serial = 10;
+  string hardware_uuid = 11;
+  string manufacturer = 12;
+  string model = 13;
+  repeated string group_ids = 14;
+  map<string, string> attributes = 15; // free-form tags/labels
+  google.protobuf.Timestamp decommissioned_at = 16;
+}
+
+// Sent by the agent on every authenticated call (matches session token).
+message DeviceIdentity {
+  string device_id = 1;
+  string session_token = 2;
+}
+
+message Group {
+  string group_id = 1;
+  string name = 2;
+  string description = 3;
+  int32 device_count = 4;
+  google.protobuf.Timestamp created_at = 5;
+}
+
+// =============================================================================
+// COMMAND PAYLOADS (MVP)
+// =============================================================================
+//
+// All command bodies hang off a CommandInstruction via oneof. To add a new
+// command type, add a new message and a new oneof variant using the next
+// available field number (currently 16+). Do not repurpose old numbers.
 
 message GetSystemInfoCommand {
   bool include_hardware = 1;
   bool include_network = 2;
+  bool include_storage = 3;
+  bool include_installed_software = 4;
 }
 
 message PowerCommand {
   PowerAction action = 1;
   bool force = 2;
   int32 delay_seconds = 3;
+  string reason = 4; // audit field, e.g. "OS update required"
 }
 
 message ManageServiceCommand {
@@ -58,7 +236,8 @@ message ManageServiceCommand {
 }
 
 message UpdateConfigurationCommand {
-  string config_payload = 1;
+  // Generic key-value config patch the agent applies locally.
+  map<string, string> config = 1;
   string config_version = 2;
   bool restart_agent = 3;
 }
@@ -67,44 +246,36 @@ message InstallUpdateCommand {
   string update_url = 1;
   string target_version = 2;
   string sha256_hash = 3;
+  bool allow_downgrade = 4;
 }
 
 message ExecuteScriptCommand {
-  string script_content = 1;
-  int32 timeout_seconds = 2;
-  string interpreter = 3;
+  string script_content = 1; // inline; for larger scripts use ExecuteScriptFromUrl (FUTURE)
+  string interpreter = 2; // "/bin/bash", "python3", "powershell"
+  int32 timeout_seconds = 3;
+  bool run_as_root = 4;
+  map<string, string> env = 5;
 }
 
 message CommandInstruction {
+  // Header fields occupy numbers 1-9. oneof variants start at 10 to leave
+  // room to add header fields without renumbering the oneof.
   string job_id = 1;
   google.protobuf.Timestamp issued_at = 2;
+  google.protobuf.Duration deadline = 3;
+  string issued_by_admin_id = 4;
+  string target_device_id = 5; // denormalized for agent-side audit
 
   oneof payload {
-    GetSystemInfoCommand get_system_info = 3;
-    PowerCommand power = 4;
-    ManageServiceCommand manage_service = 5;
-    UpdateConfigurationCommand update_config = 6;
-    InstallUpdateCommand install_update = 7;
-    ExecuteScriptCommand execute_script = 8;
+    GetSystemInfoCommand get_system_info = 10;
+    PowerCommand power = 11;
+    ManageServiceCommand manage_service = 12;
+    UpdateConfigurationCommand update_config = 13;
+    InstallUpdateCommand install_update = 14;
+    ExecuteScriptCommand execute_script = 15;
+    // Reserve 16-29 for additive command types in v1.
+    // 100+ reserved for experimental / non-stable.
   }
-}
-
-// ==============================================================================
-// DATA MODELS
-// ==============================================================================
-
-message Device {
-  string device_id = 1;
-  string hostname = 2;
-  string os_version = 3;
-  string agent_version = 4;
-  DeviceStatus status = 5;
-  google.protobuf.Timestamp last_seen = 6;
-}
-
-message DeviceIdentity {
-  string device_id = 1;
-  string auth_token = 2;
 }
 
 message CommandOutputChunk {
@@ -115,74 +286,347 @@ message CommandOutputChunk {
   bytes stderr_chunk = 5;
   optional int32 exit_code = 6;
   google.protobuf.Timestamp reported_at = 7;
+  string error_message = 8; // populated on FAIL / TIMED_OUT
 }
 
-// ==============================================================================
-// ADMIN SERVICE (Client -> Server)
-// ==============================================================================
+// =============================================================================
+// ADMIN SERVICE (Admin Client <-> Server)
+// =============================================================================
+//
+// Auth (MVP): a single bearer admin token passed in gRPC metadata:
+//   authorization: Bearer <admin_token>
+// For MVP a static shared secret is acceptable. RBAC and per-admin
+// identities are FUTURE SCOPE.A.
 
 service AdminService {
+  // ---- Enrollment (MVP) ----
+  rpc EnrollDevice(EnrollDeviceRequest) returns (EnrollDeviceResponse);
+  rpc RevokeEnrollmentToken(RevokeEnrollmentTokenRequest) returns (google.protobuf.Empty);
+  rpc ListEnrollmentTokens(ListEnrollmentTokensRequest) returns (ListEnrollmentTokensResponse);
+
+  // ---- Device inventory (MVP) ----
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
   rpc GetDevice(GetDeviceRequest) returns (Device);
+  rpc DecommissionDevice(DecommissionDeviceRequest) returns (google.protobuf.Empty);
+  rpc SetDeviceAttributes(SetDeviceAttributesRequest) returns (Device);
+
+  // ---- Groups (MVP, basic) ----
+  rpc CreateGroup(CreateGroupRequest) returns (Group);
+  rpc DeleteGroup(DeleteGroupRequest) returns (google.protobuf.Empty);
+  rpc ListGroups(ListGroupsRequest) returns (ListGroupsResponse);
+  rpc AssignDeviceToGroup(AssignDeviceToGroupRequest) returns (google.protobuf.Empty);
+  rpc RemoveDeviceFromGroup(RemoveDeviceFromGroupRequest) returns (google.protobuf.Empty);
+
+  // ---- Command dispatch (MVP) ----
   rpc DispatchCommand(DispatchCommandRequest) returns (DispatchCommandResponse);
+  rpc DispatchCommandToGroup(DispatchCommandToGroupRequest) returns (DispatchCommandResponse);
   rpc StreamJobOutput(StreamJobRequest) returns (stream CommandOutputChunk);
+  rpc CancelJob(CancelJobRequest) returns (google.protobuf.Empty);
 }
+
+// ---- Enrollment messages ----
+
+message EnrollDeviceRequest {
+  google.protobuf.Timestamp expires_at = 1; // optional; server clamps to a max
+  EnrollmentHints hints = 2;
+  string label = 3; // optional
+}
+message EnrollDeviceResponse {
+  EnrollmentToken token = 1; // `token.token` is the secret to hand to the agent
+}
+
+message RevokeEnrollmentTokenRequest {
+  string token_id = 1;
+}
+
+message ListEnrollmentTokensRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+  EnrollmentState state_filter = 3;
+}
+message ListEnrollmentTokensResponse {
+  repeated EnrollmentToken tokens = 1; // secret field is masked on read
+  string next_page_token = 2;
+}
+
+// ---- Device inventory messages ----
 
 message ListDevicesRequest {
   int32 page_size = 1;
   string page_token = 2;
-  string filter = 3;
+  DeviceStatus status_filter = 3;
+  string group_id = 4;
+  string search = 5; // free-text on hostname / serial / uuid
 }
-
 message ListDevicesResponse {
   repeated Device devices = 1;
   string next_page_token = 2;
 }
-
 message GetDeviceRequest {
   string device_id = 1;
 }
+
+message DecommissionDeviceRequest {
+  string device_id = 1;
+  bool wipe = 2; // agent performs a factory-reset (FUTURE: requires Lock/Wipe actions)
+}
+
+message SetDeviceAttributesRequest {
+  string device_id = 1;
+  map<string, string> attributes = 2; // merge-replace
+}
+
+// ---- Group messages ----
+
+message CreateGroupRequest {
+  string name = 1;
+  string description = 2;
+}
+message DeleteGroupRequest {
+  string group_id = 1;
+}
+message ListGroupsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+message ListGroupsResponse {
+  repeated Group groups = 1;
+  string next_page_token = 2;
+}
+message AssignDeviceToGroupRequest {
+  string device_id = 1;
+  string group_id = 2;
+}
+message RemoveDeviceFromGroupRequest {
+  string device_id = 1;
+  string group_id = 2;
+}
+
+// ---- Command dispatch messages ----
 
 message DispatchCommandRequest {
   string target_device_id = 1;
   CommandInstruction instruction = 2;
 }
-
+message DispatchCommandToGroupRequest {
+  string target_group_id = 1;
+  CommandInstruction instruction = 2;
+  // FUTURE: rollout strategy (canary %, staged by group, scheduled).
+}
 message DispatchCommandResponse {
-  string job_id = 1;
+  string job_id = 1; // shared across all fanout devices
   TaskState initial_state = 2;
+  int32 target_device_count = 3; // 1 for single-device, N for group
+  repeated string fanout_device_ids = 4; // resolved at dispatch time
 }
 
 message StreamJobRequest {
   string job_id = 1;
+  // FUTURE: follow mode (stream even after job completes for late chunks)
+}
+message CancelJobRequest {
+  string job_id = 1;
 }
 
-// ==============================================================================
-// AGENT SERVICE (Agent -> Server)
-// ==============================================================================
+// =============================================================================
+// AGENT SERVICE (Agent <-> Server)
+// =============================================================================
+//
+// Auth (MVP): bearer session_token in gRPC metadata, issued by Enroll.
+//   authorization: Bearer <session_token>
+// First call MUST be Enroll. After that, every other RPC must carry the
+// device_id + session_token (also via DeviceIdentity message where the
+// RPC body requires it, e.g. ListenForCommands).
 
 service AgentService {
-  rpc RegisterDevice(RegisterRequest) returns (RegisterResponse);
+  // ---- Identity (MVP) ----
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc RotateSessionToken(RotateSessionTokenRequest) returns (RotateSessionTokenResponse);
+
+  // ---- Liveness (MVP) ----
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
   rpc ReportTelemetry(TelemetryRequest) returns (google.protobuf.Empty);
+
+  // ---- Command channel (MVP) ----
   rpc ListenForCommands(DeviceIdentity) returns (stream CommandInstruction);
   rpc ReportCommandOutput(stream CommandOutputChunk) returns (google.protobuf.Empty);
 }
 
-message RegisterRequest {
-  string hostname = 1;
-  string os_version = 2;
-  string agent_version = 3;
-  string initial_auth_token = 4;
+// ---- Enrollment messages ----
+
+message EnrollRequest {
+  string token = 1;
+  DeviceFingerprint fingerprint = 2;
+  bytes agent_public_key = 3; // for future mTLS / signed payloads
+  string agent_version = 4;
+}
+message EnrollResponse {
+  string device_id = 1; // stable identity, assigned by server
+  string session_token = 2; // bearer credential
+  google.protobuf.Timestamp session_expires_at = 3;
+  ServerConfig server_config = 4;
 }
 
-message RegisterResponse {
-  string assigned_device_id = 1;
-  string session_token = 2;
+message RotateSessionTokenRequest {
+  string device_id = 1;
+  string current_session_token = 2;
+}
+message RotateSessionTokenResponse {
+  string session_token = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+// ---- Liveness / telemetry messages ----
+
+message HeartbeatRequest {
+  string device_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+}
+message HeartbeatResponse {
+  google.protobuf.Timestamp server_time = 1;
+  int32 next_heartbeat_seconds = 2;
+  bool config_changed = 3; // signal to re-fetch / re-apply config
 }
 
 message TelemetryRequest {
   string device_id = 1;
   float cpu_usage_percent = 2;
-  float memory_usage_mb = 3;
-  google.protobuf.Timestamp timestamp = 4;
+  float memory_usage_percent = 3;
+  uint64 memory_used_mb = 4;
+  uint64 disk_used_mb = 5;
+  uint64 disk_total_mb = 6;
+  google.protobuf.Timestamp timestamp = 7;
+  map<string, double> custom_metrics = 8;
 }
+
+// =============================================================================
+// FUTURE SCOPE
+// =============================================================================
+//
+// The MVP wire contract above covers: enrollment, device inventory, basic
+// groups, command dispatch with streaming output, and liveness/telemetry.
+// The capabilities below are explicitly known needs for a real device
+// management product. They are out of MVP scope; each should be slotted
+// into the appropriate service (AdminService or AgentService) when
+// designed and shipped.
+//
+// A. Auth / tenancy / RBAC
+//    - Multi-tenant org model: every resource carries an org_id; queries
+//      are tenant-scoped.
+//    - Admin identities: invite flow, password / SSO, sessions.
+//    - Roles: super-admin, org-admin, operator, auditor, read-only.
+//    - Per-admin API keys, OAuth clients.
+//    - Audit log (who did what, when, from where). Append-only, queryable.
+//    - Webhook event subscriptions (device.offline, job.failed, etc).
+//    - Replace bearer session_token with per-device mTLS certs
+//      (agent_public_key from Enroll is the seed).
+//
+// B. Enrollment / identity (extensions)
+//    - Re-enrollment on compromise: server-side invalidate, re-issue
+//      without changing device_id.
+//    - Bulk enrollment (one token with a quota that allows N devices).
+//    - Zero-touch enrollment: Apple DEP, Windows Autopilot, Android
+//      Enterprise, Linux OEM equivalents. The server hands the device
+//      an enrollment token during OOBE; the agent never sees a UI.
+//    - Pre-flight posture checks before activation (e.g. require disk
+//      encryption, minimum OS version).
+//    - Re-enroll an existing device without losing history.
+//
+// C. Device lifecycle / actions
+//    - Lock device (PIN/passcode lock screen).
+//    - Lost mode (display message, restrict, locate).
+//    - Locate (GPS / geo).
+//    - Wipe (factory reset) - the wipe flag on DecommissionDevice lands
+//      here when the agent-side support is built.
+//    - Approve / block device (admin gate before activation).
+//    - Device rename (admin sets hostname).
+//
+// D. Inventory & telemetry
+//    - Full hardware inventory: CPU model/stepping, RAM, BIOS version,
+//      disks (model, serial, SMART), NICs, GPUs, battery, TPM.
+//    - Software inventory: installed packages / apps / versions /
+//      publishers / install dates.
+//    - Patch level and OS update status.
+//    - Security posture: disk encryption state, firewall, screen lock,
+//      secure boot, OS update level.
+//    - Custom attribute schema per org (typed fields, not just strings).
+//    - Continuous push telemetry vs the current polled report.
+//    - Alerting rules: e.g. CPU > 90% for 10m -> webhook / email.
+//
+// E. Policy & configuration management
+//    - Declarative policy resources: Wi-Fi, VPN, certificates, passcode,
+//      restrictions, firewall rules, DNS, proxy.
+//    - Profile push (mobileconfig / CFProfile equivalents).
+//    - Drift detection: agent reports actual state, server diffs against
+//      desired state, server pushes remediation.
+//    - Compliance policies: posture checks as code, scheduled evaluation.
+//    - Scheduled jobs (cron-style).
+//
+// F. Software management
+//    - Package / app catalog: upload .pkg, .msi, .deb, .rpm, .apk, .ipa.
+//    - Install / uninstall / update with staged rollout.
+//    - Required vs available deployment.
+//    - Version pinning and auto-update channels (stable, beta, lts).
+//    - Detection rules: "is app X installed at version >= Y?".
+//    - Self-service portal (admin UI surface).
+//
+// G. Security / EDR
+//    - Disk encryption enforcement and reporting.
+//    - OS / patch enforcement.
+//    - Quarantine a device: revoke session, deny future commands,
+//      surface a banner on the device.
+//    - File integrity monitoring.
+//    - Vulnerability scan: CVE match against software inventory.
+//    - EDR hooks: process exec, file write, network connect events.
+//    - SBOM export (CycloneDX, SPDX).
+//
+// H. Networking
+//    - VPN profile push.
+//    - Wi-Fi profile push (SSID, EAP, cert).
+//    - Proxy / PAC / DNS configuration.
+//    - Always-on VPN with on-demand rules.
+//    - Tunneled agent communication: Wireguard / SSH tunnel so off-network
+//      devices can still reach the controller without public ingress.
+//
+// I. Files / data transfer
+//    - File fetch from device (download to admin / storage).
+//    - File push to device (distribute).
+//    - Directory listing / recursive walk.
+//    - Chunked transfer for large files.
+//    - Integrity verification (sha256).
+//
+// J. Remote access / shell
+//    - Interactive shell stream (bi-di stream with PTY semantics:
+//      resize, signal forwarding).
+//    - Remote desktop / screen share (separate media-streaming transport,
+//      out of scope for gRPC unary + streaming).
+//
+// K. Multi-user devices
+//    - List logged-in users.
+//    - Per-user policy and app assignment.
+//    - Shared / kiosk mode (single-app lockdown).
+//
+// L. Updates / OTA
+//    - Agent self-update: signed binaries, staged rollout, rollback.
+//    - OS update orchestration: download, schedule, force, defer.
+//    - Firmware update (where in scope).
+//
+// M. Reporting / analytics
+//    - Compliance reports (per device, per group, per org).
+//    - Activity reports (jobs run, errors, command frequency).
+//    - Export to SIEM (syslog, Splunk, Sentinel).
+//    - Custom dashboards / saved views.
+//    - Cost / utilization reports.
+//
+// N. Realtime / streaming
+//    - Server -> admin streaming of all device events.
+//    - Admin -> server -> agent bi-di streams for shell / live debugging.
+//    - Live telemetry fan-out (multiple admins watching one device).
+//
+// O. Schema versioning
+//    - The package `broski_connect.v1` is the contract. Breaking changes
+//      bump to v2. Additive changes (new RPCs, new fields with new
+//      numbers, new oneof variants) are allowed within a major.
+//    - Reserve, never reuse, field numbers.
+//    - oneof payloads (CommandInstruction) extend by adding new variants
+//      with the next available number; old variants stay forever.
