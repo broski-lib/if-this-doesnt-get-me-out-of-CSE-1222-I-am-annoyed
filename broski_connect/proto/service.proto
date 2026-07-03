@@ -214,7 +214,7 @@ message Group {
 //
 // All command bodies hang off a CommandInstruction via oneof. To add a new
 // command type, add a new message and a new oneof variant using the next
-// available field number (currently 16+). Do not repurpose old numbers.
+// available field number. Do not repurpose old numbers.
 
 message GetSystemInfoCommand {
   bool include_hardware = 1;
