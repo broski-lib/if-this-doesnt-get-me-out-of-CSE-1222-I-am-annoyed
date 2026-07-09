@@ -14,17 +14,11 @@ public:
   TreeNode *searchBST(TreeNode *root, int val) {
     TreeNode *current{root};
 
-    while (current->val != val) {
+    while (current != nullptr && current->val != val) {
       if (current->val > val) {
         current = current->left;
-        if (current == nullptr) {
-          return nullptr;
-        }
       } else {
         current = current->right;
-        if (current == nullptr) {
-          return nullptr;
-        }
       }
     }
 
